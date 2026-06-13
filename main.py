@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 
 import numpy as np
 import psutil
@@ -51,6 +52,28 @@ SHORTCUTS = {
     "suspend system": "systemctl suspend",
 }
 
+# Multi-step macros: spoken trigger -> list of sub-commands dispatched in order
+# Each string is handled exactly like a spoken command (after the wake word)
+MACROS = {
+    "start my day": [
+        "open dsa",  # leetcode
+        "open zed",  # zed editor
+        "open terminal",  # ghostty
+    ],
+    "work mode": [
+        "open zed",
+        "open terminal",
+        "open chrome",
+    ],
+    "chill mode": [
+        "open spotify",
+        "open chrome",
+    ],
+}
+
+# Screenshot tool — grimblast (Hyprland) with fallback to gnome-screenshot
+SCREENSHOT_DIR = os.path.expanduser("~/Pictures/Screenshots")
+
 # spoken name -> (window class to focus, command to launch if not running)
 APPS = {
     "chrome": ("google-chrome", BROWSER),
@@ -92,6 +115,26 @@ VOCAB = [
     "repositories",
     "whatsapp",
     "leetcode",
+    # volume
+    "volume",
+    "mute",
+    "unmute",
+    "louder",
+    "quieter",
+    # time & date
+    "time",
+    "date",
+    "today",
+    # screenshot
+    "screenshot",
+    "region",
+    "area",
+    "window",
+    # macros
+    "macro",
+    "mode",
+    "chill",
+    "work",
 ]
 
 # ---------- State ----------
@@ -234,8 +277,116 @@ def strip_wake_word(text):
     return text
 
 
+# ---------- Volume ----------
+def set_volume(level: int):
+    level = max(0, min(100, level))
+    run(f"pactl set-sink-volume @DEFAULT_SINK@ {level}%")
+    speak(f"Volume set to {level} percent.")
+
+
+def change_volume(delta: int):
+    sign = "+" if delta >= 0 else "-"
+    run(f"pactl set-sink-volume @DEFAULT_SINK@ {sign}{abs(delta)}%")
+    direction = "up" if delta >= 0 else "down"
+    speak(f"Volume {direction} by {abs(delta)} percent.")
+
+
+def toggle_mute():
+    run("pactl set-sink-mute @DEFAULT_SINK@ toggle")
+    speak("Toggled mute.")
+
+
+# ---------- Time & date ----------
+def tell_time():
+    now = datetime.now()
+    speak(now.strftime("It's %I:%M %p."))
+
+
+def tell_date():
+    now = datetime.now()
+    speak(now.strftime("Today is %A, %B %d, %Y."))
+
+
+def tell_datetime():
+    now = datetime.now()
+    speak(now.strftime("It's %I:%M %p on %A, %B %d."))
+
+
+# ---------- Screenshot ----------
+def _screenshot_path(label="screenshot"):
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return os.path.join(SCREENSHOT_DIR, f"{label}_{stamp}.png")
+
+
+def screenshot_full():
+    path = _screenshot_path("full")
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        run(f"grimblast save screen {path}")
+    elif os.environ.get("SWAYSOCK"):
+        run(f"grim {path}")
+    else:
+        run(f"gnome-screenshot -f {path}")
+    notify(f"Screenshot saved to {path}")
+
+
+# ---------- Multi-step macros ----------
+def run_macro(name: str):
+    """Fuzzy-match a macro name and dispatch each sub-command with a small delay."""
+    match = fuzzproc.extractOne(name, MACROS.keys(), scorer=fuzz.token_sort_ratio)
+    if not match or match[1] < FUZZY_THRESHOLD:
+        notify(f"Unknown macro: {name}")
+        return
+    macro_name = match[0]
+    steps = MACROS[macro_name]
+    speak(f"Starting {macro_name}.")
+
+    def _dispatch():
+        for step in steps:
+            # Synthesise a fake "friday <step>" utterance so handle() processes it
+            fake = f"{WAKE_WORD} {step}"
+            handle(fake)
+            time.sleep(1.2)  # small gap so windows don't race each other
+
+    threading.Thread(target=_dispatch, daemon=True).start()
+
+
 # ---------- Intent matching ----------
 INTENTS = [
+    # ---- Volume ----
+    (r"set volume (?:to )?(\d+)", lambda m: set_volume(int(m[1]))),
+    (r"volume (?:to )?(\d+)(?:\s*percent)?", lambda m: set_volume(int(m[1]))),
+    (
+        r"(?:turn|crank|bring) (?:the )?volume up(?: by (\d+))?",
+        lambda m: change_volume(int(m[1]) if m[1] else 10),
+    ),
+    (
+        r"(?:turn|bring) (?:the )?volume down(?: by (\d+))?",
+        lambda m: change_volume(-(int(m[1]) if m[1] else 10)),
+    ),
+    (r"(?:mute|unmute|toggle mute)", lambda m: toggle_mute()),
+    # ---- Time & date ----
+    (r"what(?:'s| is) (?:the )?time", lambda m: tell_time()),
+    (r"what time is it", lambda m: tell_time()),
+    (r"what(?:'s| is) (?:the )?date", lambda m: tell_date()),
+    (r"what(?:'s| is) today", lambda m: tell_date()),
+    (r"what(?:'s| is) (?:the )?day", lambda m: tell_date()),
+    (r"date and time|time and date", lambda m: tell_datetime()),
+    # ---- Multi-step macros (must come before open/launch to avoid partial match) ----
+    (r"^(start my day|work mode|chill mode)$", lambda m: run_macro(m[1])),
+    (
+        r"(?:run|execute|start) (?:macro |mode )?(.+)",
+        lambda m: (
+            run_macro(m[1])
+            if fuzzproc.extractOne(m[1], MACROS.keys(), scorer=fuzz.token_sort_ratio)
+            and fuzzproc.extractOne(m[1], MACROS.keys(), scorer=fuzz.token_sort_ratio)[
+                1
+            ]
+            >= FUZZY_THRESHOLD
+            else None
+        ),
+    ),
+    # ---- Existing intents ----
     (
         r"open (?:my )?github (?:repositories|repos)",
         lambda m: run(
