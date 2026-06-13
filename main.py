@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 
 import numpy as np
 import psutil
@@ -43,12 +44,51 @@ FOLDERS = {
 }
 
 SHORTCUTS = {
-    "docker status": "docker ps",
-    "start docker": "systemctl start docker",
-    "stop docker": "systemctl stop docker",
-    "docker compose up": "docker compose up -d",
     "lock screen": "loginctl lock-session",
     "suspend system": "systemctl suspend",
+}
+
+# Docker commands with voice feedback and terminal display
+DOCKER_COMMANDS = {
+    "docker status": {
+        "cmd": "docker ps",
+        "speak": "Checking Docker status",
+        "terminal": True,
+    },
+    "start docker": {
+        "cmd": "systemctl start docker",
+        "speak": "Starting Docker",
+        "terminal": True,
+    },
+    "stop docker": {
+        "cmd": "systemctl stop docker",
+        "speak": "Stopping Docker",
+        "terminal": True,
+    },
+    "docker compose up": {
+        "cmd": "docker compose up -d",
+        "speak": "Starting Docker Compose",
+        "terminal": True,
+    },
+}
+
+# Multi-step macros: spoken trigger -> list of sub-commands dispatched in order
+# Each string is handled exactly like a spoken command (after the wake word)
+MACROS = {
+    "start my day": [
+        "open dsa",  # leetcode
+        "open zed",  # zed editor
+        "open terminal",  # ghostty
+    ],
+    "work mode": [
+        "open zed",
+        "open terminal",
+        "open chrome",
+    ],
+    "chill mode": [
+        "open spotify",
+        "open chrome",
+    ],
 }
 
 # spoken name -> (window class to focus, command to launch if not running)
@@ -81,6 +121,7 @@ VOCAB = [
     "screen",
     "suspend",
     "chatgpt",
+    "gpt",
     "sleep",
     "wake",
     "spotify",
@@ -92,6 +133,21 @@ VOCAB = [
     "repositories",
     "whatsapp",
     "leetcode",
+    # volume
+    "volume",
+    "mute",
+    "unmute",
+    "louder",
+    "quieter",
+    # time & date
+    "time",
+    "date",
+    "today",
+    # macros
+    "macro",
+    "mode",
+    "chill",
+    "work",
 ]
 
 # ---------- State ----------
@@ -148,6 +204,24 @@ def speak(text):
             notify(text)  # piper or aplay missing, fall back to notification
 
     threading.Thread(target=_tts, daemon=True).start()
+
+
+def run_docker_command(name: str):
+    """Run docker command in visible terminal with voice feedback."""
+    if name not in DOCKER_COMMANDS:
+        return False
+    
+    config = DOCKER_COMMANDS[name]
+    speak(config["speak"])
+    
+    if config.get("terminal", False):
+        # Run in a new terminal window so user can see output
+        run([TERMINAL, "-e", "bash", "-c", f"{config['cmd']}; echo; read -p 'Press Enter to close...'"])
+    else:
+        run(config["cmd"])
+    
+    notify(f"Ran: {name}")
+    return True
 
 
 def system_report():
@@ -234,8 +308,110 @@ def strip_wake_word(text):
     return text
 
 
+# ---------- Volume ----------
+def set_volume(level: int):
+    level = max(0, min(100, level))
+    run(f"pactl set-sink-volume @DEFAULT_SINK@ {level}%")
+    speak(f"Volume set to {level} percent.")
+
+
+def change_volume(delta: int):
+    sign = "+" if delta >= 0 else "-"
+    run(f"pactl set-sink-volume @DEFAULT_SINK@ {sign}{abs(delta)}%")
+    direction = "up" if delta >= 0 else "down"
+    speak(f"Volume {direction} by {abs(delta)} percent.")
+
+
+def mute():
+    run("pactl set-sink-mute @DEFAULT_SINK@ 1")
+    speak("Muted.")
+
+
+def unmute():
+    run("pactl set-sink-mute @DEFAULT_SINK@ 0")
+    speak("Unmuted.")
+
+
+def toggle_mute():
+    run("pactl set-sink-mute @DEFAULT_SINK@ toggle")
+    speak("Toggled mute.")
+
+
+# ---------- Time & date ----------
+def tell_time():
+    now = datetime.now()
+    speak(now.strftime("It's %I:%M %p."))
+
+
+def tell_date():
+    now = datetime.now()
+    speak(now.strftime("Today is %A, %B %d, %Y."))
+
+
+def tell_datetime():
+    now = datetime.now()
+    speak(now.strftime("It's %I:%M %p on %A, %B %d."))
+
+
+# ---------- Multi-step macros ----------
+def run_macro(name: str):
+    """Fuzzy-match a macro name and dispatch each sub-command with a small delay."""
+    match = fuzzproc.extractOne(name, MACROS.keys(), scorer=fuzz.token_sort_ratio)
+    if not match or match[1] < FUZZY_THRESHOLD:
+        notify(f"Unknown macro: {name}")
+        return
+    macro_name = match[0]
+    steps = MACROS[macro_name]
+    speak(f"Starting {macro_name}.")
+
+    def _dispatch():
+        for step in steps:
+            # Synthesise a fake "friday <step>" utterance so handle() processes it
+            fake = f"{WAKE_WORD} {step}"
+            handle(fake)
+            time.sleep(1.2)  # small gap so windows don't race each other
+
+    threading.Thread(target=_dispatch, daemon=True).start()
+
+
 # ---------- Intent matching ----------
 INTENTS = [
+    # ---- Volume ----
+    (r"set volume (?:to )?(\d+)", lambda m: set_volume(int(m[1]))),
+    (r"volume (?:to )?(\d+)(?:\s*percent)?", lambda m: set_volume(int(m[1]))),
+    (
+        r"(?:turn|crank|bring) (?:the )?volume up(?: by (\d+))?",
+        lambda m: change_volume(int(m[1]) if m[1] else 10),
+    ),
+    (
+        r"(?:turn|bring) (?:the )?volume down(?: by (\d+))?",
+        lambda m: change_volume(-(int(m[1]) if m[1] else 10)),
+    ),
+    (r"toggle mute", lambda m: toggle_mute()),
+    (r"unmute", lambda m: unmute()),
+    (r"mute", lambda m: mute()),
+    # ---- Time & date ----
+    (r"what(?:'s| is) (?:the )?time", lambda m: tell_time()),
+    (r"what time is it", lambda m: tell_time()),
+    (r"what(?:'s| is) (?:the )?date", lambda m: tell_date()),
+    (r"what(?:'s| is) today", lambda m: tell_date()),
+    (r"what(?:'s| is) (?:the )?day", lambda m: tell_date()),
+    (r"date and time|time and date", lambda m: tell_datetime()),
+    # ---- Multi-step macros (must come before open/launch to avoid partial match) ----
+    (r"^(start my day|work mode|chill mode)$", lambda m: run_macro(m[1])),
+    (
+        r"(?:run|execute|start) (?:macro |mode )(.+)",
+        lambda m: (
+            run_macro(m[1])
+            if fuzzproc.extractOne(m[1], MACROS.keys(), scorer=fuzz.token_sort_ratio)
+            and fuzzproc.extractOne(m[1], MACROS.keys(), scorer=fuzz.token_sort_ratio)[
+                1
+            ]
+            >= FUZZY_THRESHOLD
+            else None
+        ),
+    ),
+    # ---- Existing intents ----
     (
         r"open (?:my )?github (?:repositories|repos)",
         lambda m: run(
@@ -263,7 +439,7 @@ INTENTS = [
     (r"search (?:for )?(.+?) (?:on|in) chrome", lambda m: web_search("chrome", m[1])),
     (r"search (?:for )?(.+?) (?:on|in) youtube", lambda m: web_search("youtube", m[1])),
     (
-        r"(?:open chat ?gpt and )?(?:ask|search) chat ?gpt (.+)",
+        r"(?:open (?:chat ?gpt|gpt) and )?(?:ask|search) (?:chat ?gpt|gpt) (.+)",
         lambda m: web_search("chatgpt", m[1]),
     ),
     (r"(?:system )?status report|system status", lambda m: system_report()),
@@ -300,6 +476,11 @@ def handle(text):
         for pattern, action in INTENTS:
             if m := re.search(pattern, cmd):
                 action(m)
+                return
+        # fuzzy match against docker commands first
+        match = fuzzproc.extractOne(cmd, DOCKER_COMMANDS.keys(), scorer=fuzz.token_sort_ratio)
+        if match and match[1] >= FUZZY_THRESHOLD:
+            if run_docker_command(match[0]):
                 return
         # fuzzy match against shortcut phrases
         match = fuzzproc.extractOne(cmd, SHORTCUTS.keys(), scorer=fuzz.token_sort_ratio)
