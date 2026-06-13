@@ -77,11 +77,11 @@ DOCKER_COMMANDS = {
 MACROS = {
     "start my day": [
         "open dsa",  # leetcode
-        "open zed",  # zed editor
+        "open editor",  # zed editor
         "open terminal",  # ghostty
     ],
     "work mode": [
-        "open zed",
+        "open editor",
         "open terminal",
         "open chrome",
     ],
@@ -94,7 +94,7 @@ MACROS = {
 # spoken name -> (window class to focus, command to launch if not running)
 APPS = {
     "chrome": ("google-chrome", BROWSER),
-    "zed": ("dev.zed.Zed", "zed"),
+    "editor": ("zeditor", "zeditor"),
     "terminal": ("com.mitchellh.ghostty", TERMINAL),
     "files": ("org.gnome.Nautilus", "nautilus"),
     "spotify": ("spotify", "spotify"),
@@ -210,16 +210,24 @@ def run_docker_command(name: str):
     """Run docker command in visible terminal with voice feedback."""
     if name not in DOCKER_COMMANDS:
         return False
-    
+
     config = DOCKER_COMMANDS[name]
     speak(config["speak"])
-    
+
     if config.get("terminal", False):
         # Run in a new terminal window so user can see output
-        run([TERMINAL, "-e", "bash", "-c", f"{config['cmd']}; echo; read -p 'Press Enter to close...'"])
+        run(
+            [
+                TERMINAL,
+                "-e",
+                "bash",
+                "-c",
+                f"{config['cmd']}; echo; read -p 'Press Enter to close...'",
+            ]
+        )
     else:
         run(config["cmd"])
-    
+
     notify(f"Ran: {name}")
     return True
 
@@ -478,7 +486,9 @@ def handle(text):
                 action(m)
                 return
         # fuzzy match against docker commands first
-        match = fuzzproc.extractOne(cmd, DOCKER_COMMANDS.keys(), scorer=fuzz.token_sort_ratio)
+        match = fuzzproc.extractOne(
+            cmd, DOCKER_COMMANDS.keys(), scorer=fuzz.token_sort_ratio
+        )
         if match and match[1] >= FUZZY_THRESHOLD:
             if run_docker_command(match[0]):
                 return
